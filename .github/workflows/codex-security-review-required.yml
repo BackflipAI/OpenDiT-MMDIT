@@ -1,0 +1,114 @@
+name: Codex Security Review completion
+
+on:
+  pull_request:
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  security-review-completed:
+    name: Codex Security Review (required)
+    if: true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - name: Verify Codex reviewed this PR head
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          """Require Codex's authenticated security-review receipt for a PR head.
+
+          This checks completion, not the absence of vulnerabilities. The v1 receipt
+          format is supplied by the Codex GitHub integration; an unrecognized format
+          must block rather than silently treating the review as complete.
+          """
+
+          import json
+          import os
+          import re
+          import sys
+          import time
+          import urllib.request
+
+          CODEX_BOT_ID = 199175422
+          CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]"
+
+
+          def completed_receipt(comment, repository, number, head):
+              user = comment.get("user") or {}
+              if user.get("id") != CODEX_BOT_ID or user.get("login") != CODEX_BOT_LOGIN:
+                  return False
+              body = comment.get("body") or ""
+              match = re.search(r"<!-- codex-security-review:v1 (\{[^\n]*\}) -->", body)
+              if not match:
+                  return False
+              try:
+                  receipt = json.loads(match.group(1))
+              except (json.JSONDecodeError, TypeError):
+                  return False
+              return (
+                  isinstance(receipt, dict)
+                  and receipt.get("repository") == repository
+                  and receipt.get("pullRequestNumber") == number
+                  and receipt.get("headSha") == head
+                  and receipt.get("status") == "completed"
+              )
+
+
+          def main():
+              with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as source:
+                  event = json.load(source)
+              repository = os.environ["GITHUB_REPOSITORY"]
+              pr = event["pull_request"]
+              number, head = pr["number"], pr["head"]["sha"]
+              if pr["base"]["repo"]["full_name"] != repository:
+                  raise RuntimeError("The event does not belong to this repository")
+              api = os.environ["GITHUB_API_URL"].rstrip("/")
+              token = os.environ["GH_TOKEN"]
+
+              def read(path):
+                  request = urllib.request.Request(
+                      api + path,
+                      headers={
+                          "Authorization": "Bearer " + token,
+                          "Accept": "application/vnd.github+json",
+                          "X-GitHub-Api-Version": "2022-11-28",
+                          "User-Agent": "Backflip-Codex-security-completion-check",
+                      },
+                  )
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      return json.load(response)
+
+              pr_path = f"/repos/{repository}/pulls/{number}"
+              deadline = time.monotonic() + 1800
+              print(f"Waiting for Codex Security Review of {repository}#{number} at {head}", flush=True)
+              while time.monotonic() < deadline:
+                  current = read(pr_path)
+                  if current["state"] != "open" or current["head"]["sha"] != head:
+                      raise RuntimeError("PR closed or head changed; this run cannot approve the new head")
+                  page = 1
+                  found = False
+                  while True:
+                      comments = read(f"/repos/{repository}/issues/{number}/comments?per_page=100&page={page}")
+                      found = any(completed_receipt(c, repository, number, head) for c in comments)
+                      if found or len(comments) < 100:
+                          break
+                      page += 1
+                  if found:
+                      if read(pr_path)["head"]["sha"] != head:
+                          raise RuntimeError("PR head changed while checking the receipt")
+                      print("Codex Security Review completed for this PR head.", flush=True)
+                      return
+                  time.sleep(15)
+              raise RuntimeError("No completed Codex Security Review for this head within 30 minutes. Re-run after completion, or use the authorized PR bypass.")
+
+
+          if __name__ == "__main__":
+              try:
+                  main()
+              except Exception as error:
+                  print(f"Security review completion check failed: {error}", file=sys.stderr)
+                  sys.exit(1)
