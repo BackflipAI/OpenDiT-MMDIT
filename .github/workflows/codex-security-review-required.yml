@@ -34,12 +34,27 @@ jobs:
           import urllib.request
 
           CODEX_BOT_ID = 199175422
-          CODEX_BOT_LOGIN = "chatgpt-codex-connector[bot]"
+
+
+          def trusted_bot(actor):
+              return (
+                  isinstance(actor, dict)
+                  and actor.get("__typename") == "Bot"
+                  and actor.get("databaseId") == CODEX_BOT_ID
+              )
 
 
           def completed_receipt(comment, repository, number, head):
-              user = comment.get("user") or {}
-              if user.get("id") != CODEX_BOT_ID or user.get("login") != CODEX_BOT_LOGIN:
+              if not trusted_bot(comment.get("author")):
+                  return False
+              if "lastEditedAt" not in comment or "editor" not in comment:
+                  return False
+              # Repository writers can edit another account's comment. Read body and
+              # editor together from GraphQL so a copied or edited receipt cannot pass.
+              editor = comment["editor"]
+              if editor is not None and not trusted_bot(editor):
+                  return False
+              if comment["lastEditedAt"] is not None and not trusted_bot(editor):
                   return False
               body = comment.get("body") or ""
               match = re.search(r"<!-- codex-security-review:v1 (\{[^\n]*\}) -->", body)
@@ -82,6 +97,31 @@ jobs:
                   with urllib.request.urlopen(request, timeout=30) as response:
                       return json.load(response)
 
+              def verified_comments(ids):
+                  query = """query($ids: [ID!]!) {
+                    nodes(ids: $ids) {
+                      ... on IssueComment {
+                        body lastEditedAt
+                        author { __typename login ... on Bot { databaseId } }
+                        editor { __typename login ... on Bot { databaseId } }
+                      }
+                    }
+                  }"""
+                  request = urllib.request.Request(
+                      os.environ["GITHUB_GRAPHQL_URL"],
+                      data=json.dumps({"query": query, "variables": {"ids": ids}}).encode(),
+                      headers={
+                          "Authorization": "Bearer " + token,
+                          "Content-Type": "application/json",
+                          "User-Agent": "Backflip-Codex-security-completion-check",
+                      },
+                  )
+                  with urllib.request.urlopen(request, timeout=30) as response:
+                      result = json.load(response)
+                  if result.get("errors") or not isinstance(result.get("data", {}).get("nodes"), list):
+                      raise RuntimeError("GitHub could not verify the receipt author and editor")
+                  return [comment for comment in result["data"]["nodes"] if comment is not None]
+
               pr_path = f"/repos/{repository}/pulls/{number}"
               deadline = time.monotonic() + 1800
               print(f"Waiting for Codex Security Review of {repository}#{number} at {head}", flush=True)
@@ -93,7 +133,15 @@ jobs:
                   found = False
                   while True:
                       comments = read(f"/repos/{repository}/issues/{number}/comments?per_page=100&page={page}")
-                      found = any(completed_receipt(c, repository, number, head) for c in comments)
+                      candidates = [
+                          c["node_id"] for c in comments
+                          if (c.get("user") or {}).get("id") == CODEX_BOT_ID
+                          and "codex-security-review:v1" in (c.get("body") or "")
+                      ]
+                      found = bool(candidates) and any(
+                          completed_receipt(c, repository, number, head)
+                          for c in verified_comments(candidates)
+                      )
                       if found or len(comments) < 100:
                           break
                       page += 1
