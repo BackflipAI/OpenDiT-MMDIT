@@ -1,7 +1,7 @@
 name: Codex Security Review completion
 
 on:
-  pull_request:
+  pull_request_target:
 
 permissions:
   contents: read
@@ -17,6 +17,7 @@ jobs:
       - name: Verify Codex reviewed this PR head
         env:
           GH_TOKEN: ${{ github.token }}
+          ORG_MEMBERS_READ_TOKEN: ${{ secrets.SECURITY_REVIEW_MEMBERS_READ_TOKEN }}
         shell: python
         run: |
           """Require Codex's authenticated security-review receipt for a PR head.
@@ -27,6 +28,7 @@ jobs:
           """
 
           import json
+          import html
           import os
           import re
           import sys
@@ -34,6 +36,72 @@ jobs:
           import urllib.request
 
           CODEX_BOT_ID = 199175422
+          ENGINEERING_TEAM_ID = 8030510
+          ENGINEERING_MEMBERSHIP_PATH = "/orgs/BackflipAI/teams/engineering/memberships/"
+
+
+          def exception_request(comment, head):
+              """Only an original, unedited human comment can request an exception."""
+              actor = comment.get("author") or {}
+              if (actor.get("__typename") != "User"
+                  or type(actor.get("databaseId")) is not int
+                  or not actor.get("login")
+                  or not comment.get("createdAt")
+                  or not comment.get("url")
+                  or "lastEditedAt" not in comment
+                  or comment["lastEditedAt"] is not None
+                  or "editor" not in comment
+                  or comment["editor"] is not None):
+                  return None
+              match = re.fullmatch(
+                  r"/security-review-exception ([0-9a-f]{40}) ([\s\S]{10,2000})",
+                  comment.get("body") or "",
+              )
+              if not match or match[1] != head:
+                  return None
+              reason = match[2].strip()
+              if len(reason) < 10 or not any(c.isalnum() for c in reason):
+                  return None
+              return {
+                  "requester": actor["login"],
+                  "requester_id": actor["databaseId"],
+                  "requested_at": comment["createdAt"],
+                  "comment_url": comment["url"],
+                  "head_sha": head,
+                  "reason": reason,
+              }
+
+
+          def engineering_authorized(request, read, read_members):
+              """Check live membership, immutable team ID, and the human's numeric ID."""
+              login = request["requester"]
+              if not re.fullmatch(r"[A-Za-z0-9-]{1,39}", login):
+                  return False
+              team = read_members("/orgs/BackflipAI/teams/engineering")
+              if team.get("id") != ENGINEERING_TEAM_ID:
+                  return False
+              identity = read("/users/" + login)
+              if identity.get("id") != request["requester_id"] or identity.get("type") != "User":
+                  return False
+              membership = read_members(ENGINEERING_MEMBERSHIP_PATH + login)
+              if membership.get("state") != "active":
+                  return False
+              # Do not accidentally authorize a newly created owner of a renamed login.
+              return read("/users/" + login).get("id") == request["requester_id"]
+
+
+          def write_exception_audit(request, repository, number):
+              audit = dict(request, repository=repository, pull_request=number,
+                           waived_requirement="Codex security review completion",
+                           run_url=(os.environ["GITHUB_SERVER_URL"] + "/" + repository
+                                    + "/actions/runs/" + os.environ["GITHUB_RUN_ID"]),
+                           run_attempt=os.environ.get("GITHUB_RUN_ATTEMPT", "1"))
+              print("SECURITY_EXCEPTION_AUDIT " + json.dumps(audit, ensure_ascii=True), flush=True)
+              with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+                  summary.write("### Security review completion waived\n\n<pre>"
+                                + html.escape(json.dumps(audit, indent=2, ensure_ascii=True))
+                                + "</pre>\n\nOther approval and CI requirements still apply.\n")
+              return audit
 
 
           def trusted_bot(actor):
@@ -84,11 +152,11 @@ jobs:
               api = os.environ["GITHUB_API_URL"].rstrip("/")
               token = os.environ["GH_TOKEN"]
 
-              def read(path):
+              def api_read(path, credential):
                   request = urllib.request.Request(
                       api + path,
                       headers={
-                          "Authorization": "Bearer " + token,
+                          "Authorization": "Bearer " + credential,
                           "Accept": "application/vnd.github+json",
                           "X-GitHub-Api-Version": "2022-11-28",
                           "User-Agent": "Backflip-Codex-security-completion-check",
@@ -97,13 +165,23 @@ jobs:
                   with urllib.request.urlopen(request, timeout=30) as response:
                       return json.load(response)
 
+              def read(path):
+                  return api_read(path, token)
+
+              members_token = os.environ.get("ORG_MEMBERS_READ_TOKEN", "")
+
+              def read_members(path):
+                  if not members_token:
+                      raise RuntimeError("Engineering membership credential is not configured")
+                  return api_read(path, members_token)
+
               def verified_comments(ids):
                   query = """query($ids: [ID!]!) {
                     nodes(ids: $ids) {
                       ... on IssueComment {
-                        body lastEditedAt
-                        author { __typename login ... on Bot { databaseId } }
-                        editor { __typename login ... on Bot { databaseId } }
+                        body lastEditedAt createdAt url
+                        author { __typename login ... on Bot { databaseId } ... on User { databaseId } }
+                        editor { __typename login ... on Bot { databaseId } ... on User { databaseId } }
                       }
                     }
                   }"""
@@ -125,6 +203,7 @@ jobs:
               pr_path = f"/repos/{repository}/pulls/{number}"
               deadline = time.monotonic() + 1800
               print(f"Waiting for Codex Security Review of {repository}#{number} at {head}", flush=True)
+              denied_comments = set()
               while time.monotonic() < deadline:
                   current = read(pr_path)
                   if current["state"] != "open" or current["head"]["sha"] != head:
@@ -135,13 +214,42 @@ jobs:
                       comments = read(f"/repos/{repository}/issues/{number}/comments?per_page=100&page={page}")
                       candidates = [
                           c["node_id"] for c in comments
-                          if (c.get("user") or {}).get("id") == CODEX_BOT_ID
-                          and "codex-security-review:v1" in (c.get("body") or "")
+                          if (((c.get("user") or {}).get("id") == CODEX_BOT_ID
+                               and "codex-security-review:v1" in (c.get("body") or ""))
+                              or (c.get("body") or "").startswith("/security-review-exception "))
                       ]
-                      found = bool(candidates) and any(
+                      verified = verified_comments(candidates) if candidates else []
+                      found = any(
                           completed_receipt(c, repository, number, head)
-                          for c in verified_comments(candidates)
+                          for c in verified
                       )
+                      if not found:
+                          for comment in verified:
+                              request = exception_request(comment, head)
+                              if request is None:
+                                  continue
+                              try:
+                                  authorized = engineering_authorized(request, read, read_members)
+                              except Exception:
+                                  authorized = False
+                              if not authorized:
+                                  if request["comment_url"] not in denied_comments:
+                                      print("Exception not accepted: live Engineering membership could not be verified.", flush=True)
+                                      denied_comments.add(request["comment_url"])
+                                  continue
+                              current = read(pr_path)
+                              if current["state"] != "open" or current["head"]["sha"] != head:
+                                  raise RuntimeError("PR closed or head changed while authorizing exception")
+                              # Re-read the exact comment before accepting, to catch edits/deletions.
+                              refreshed = verified_comments([next(c["node_id"] for c in comments
+                                                                  if c["html_url"] == request["comment_url"])])
+                              if not refreshed or exception_request(refreshed[0], head) != request:
+                                  continue
+                              current = read(pr_path)
+                              if current["state"] != "open" or current["head"]["sha"] != head:
+                                  raise RuntimeError("PR closed or head changed while confirming exception")
+                              write_exception_audit(request, repository, number)
+                              return
                       if found or len(comments) < 100:
                           break
                       page += 1
@@ -151,7 +259,7 @@ jobs:
                       print("Codex Security Review completed for this PR head.", flush=True)
                       return
                   time.sleep(15)
-              raise RuntimeError("No completed Codex Security Review for this head within 30 minutes. Re-run after completion, or use the authorized PR bypass.")
+              raise RuntimeError("No completed Codex Security Review or authorized exact-head exception within 30 minutes. Re-run after completion or after an Engineering member posts /security-review-exception FULL_HEAD_SHA REASON.")
 
 
           if __name__ == "__main__":
@@ -160,3 +268,4 @@ jobs:
               except Exception as error:
                   print(f"Security review completion check failed: {error}", file=sys.stderr)
                   sys.exit(1)
+
